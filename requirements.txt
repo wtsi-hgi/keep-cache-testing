@@ -1,0 +1,3 @@
+requests==2.10.0
+git+https://github.com/wtsi-hgi/arvados.git@keep-lmdb-cache#subdirectory=sdk/python&egg=arvados-python-client
+monotonic==1.1
