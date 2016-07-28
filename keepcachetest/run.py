@@ -1,54 +1,100 @@
 import json
 import logging
+import sys
+import traceback
+from threading import Semaphore
 
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from monotonic import monotonic
 
-from arvados import KeepBlockCacheWithBlockStore
 from arvados.keepcache.block_store import BookkeepingBlockStore, \
-    InMemoryBlockStore
+    InMemoryBlockStore, LMDBBlockStore
 from arvados.keepcache.block_store_bookkeepers import \
-    InMemoryBlockStoreBookkeeper
+    SqlBlockStoreBookkeeper, InMemoryBlockStoreBookkeeper
+from arvados.keepcache.caches import KeepBlockCacheWithBlockStore
+from arvados.keepcache.replacement_policies import LastUsedReplacementPolicy
 from keepcachetest.block_access import BlockGenerator
+from keepcachetest.helpers import create_temp_directory
 from keepcachetest.json_converters import record_to_json
 
-_simulator_api = "http://localhost:8080"
-_block_request_generator = BlockGenerator(_simulator_api)
-_block_store = BookkeepingBlockStore(
-    # LMDBBlockStore("/tmp/lmdb", cache_size),
-    InMemoryBlockStore(),
-    # SqlBlockStoreBookkeeper("sqlite:////var/folders/kt/b0m4btrs1h773j_1z_x64pkc000g3d/T/tmp9IrtVx")
-    InMemoryBlockStoreBookkeeper()
+_ONE_KB = 1 * 1024
+_ONE_MB = 1 * 1024 * _ONE_KB
+_ONE_GB = 1 * 1024 * _ONE_MB
+
+iterations = 500
+max_threads = 10
+cache_size = 2 * _ONE_GB
+simulator_api = "http://localhost:8080"
+block_store = BookkeepingBlockStore(
+    LMDBBlockStore(create_temp_directory(), cache_size, max_readers=126),
+    # RocksDBBlockStore(create_temp_directory()),
+    # DiskOnlyBlockStore(create_temp_directory()),
+    # InMemoryBlockStore(),
+    # InMemoryBlockStoreBookkeeper()
+    SqlBlockStoreBookkeeper("sqlite:///%s/database.db" % create_temp_directory())
 )
-_cache = KeepBlockCacheWithBlockStore(_block_store, 1 * 1024 * 1024 * 1024)
+cache = KeepBlockCacheWithBlockStore(
+    block_store,
+    int(block_store._block_store.calculate_usuable_size() * 0.5),
+    # cache_size,
+    cache_replacement_policy=LastUsedReplacementPolicy())
+
+_block_request_generator = BlockGenerator(simulator_api)
+_complete = Semaphore(0)
+
+
+def use_cache():
+    messages = []
+    try:
+        block = _block_request_generator.get_next_block()
+        messages.append("Next requested block has hash: %s" % block.hash)
+        slot = cache.get(block.hash)
+        if slot is None:
+            messages.append("Cache miss")
+            slot, _ = cache.reserve_cache(block.hash)
+            slot.set(block.contents)
+        else:
+            messages.append("Cache hit")
+
+        cache.cap_cache()
+        cache_size = cache.block_store.bookkeeper.get_active_storage_size()
+        messages.append("Current cache size = %d bytes" % cache_size)
+    except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        full_error_message = repr(traceback.format_exception(
+            exc_type, exc_value, exc_traceback))
+        messages.append(full_error_message)
+    finally:
+        logging.info(messages)
+        _complete.release()
 
 
 def run():
-    i = 0
-    while i < 10:
-        i += 1
-        block = _block_request_generator.get_next_block()
-        logging.info("Next requested (%d) block has hash: %s" % (i, block.hash))
-        slot = _cache.get(block.hash)
-        if slot is None:
-            logging.info("Cache miss")
-            slot, _ = _cache.reserve_cache(block.hash)
-            slot.set(block.contents)
-        else:
-            logging.info("Cache hit")
-        _cache.cap_cache()
-        start = monotonic()
-        cache_size = _cache.block_store.bookkeeper.get_active_storage_size()
-        logging.info("Cache size = %d bytes (calculated in %fs" % (cache_size, monotonic() - start))
+    run_start = monotonic()
+    executor = ThreadPoolExecutor(max_workers=max_threads)
+    for i in range(iterations):
+        executor.submit(use_cache)
+    print("Submitted all request jobs")
+
+    count = 0
+    while count < iterations:
+        _complete.acquire()
+        count += 1
+        logging.info("%d requests completed" % count)
+    executor.shutdown()
 
     print(json.dumps({
-        "references": json.loads(requests.get("%s/v1/blockfile/references" % _simulator_api).text),
-        "non-references": json.loads(requests.get("%s/v1/blockfile/non-references" % _simulator_api).text),
-        "records": [record_to_json(record) for record in _cache.block_store.bookkeeper.get_all_records()]
+        "time_taken": monotonic() - run_start,
+        "references": json.loads(requests.get("%s/v1/blockfile/references" % simulator_api).text),
+        "non-references": json.loads(requests.get("%s/v1/blockfile/non-references" % simulator_api).text),
+        "records": [record_to_json(record) for record in cache.block_store.bookkeeper.get_all_records()]
     }, indent=4))
 
 
 if __name__ == "__main__":
     logging.getLogger("requests").setLevel(logging.ERROR)
+    logging.getLogger("arvados.keepcache.block_store").setLevel(logging.ERROR)
     logging.root.setLevel(logging.DEBUG)
     run()
+
